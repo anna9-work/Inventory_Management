@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import line from '@line/bot-sdk';
+import { middleware } from '@line/bot-sdk';
 
 const app = express();
 
@@ -13,7 +13,7 @@ app.get('/health', (req, res) => {
   res.status(200).send('ok');
 });
 
-app.post('/webhook', line.middleware(lineConfig), (req, res) => {
+app.post('/webhook', middleware(lineConfig), (req, res) => {
   // 鐵律：立刻回 200，避免 LINE webhook 重送
   res.sendStatus(200);
 
