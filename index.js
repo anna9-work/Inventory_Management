@@ -1,7 +1,6 @@
-// index.js
 import 'dotenv/config';
 import express from 'express';
-import line, { middleware } from '@line/bot-sdk';
+import { middleware, Client } from '@line/bot-sdk';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -15,7 +14,7 @@ const {
   LINE_CHANNEL_ACCESS_TOKEN,
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
-  GROUP_CODE = 'catch_0001', // 單店 bot：預設這個群組代碼
+  GROUP_CODE = 'catch_0001'
 } = process.env;
 
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) {
@@ -30,13 +29,14 @@ const lineConfig = {
   channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
 };
 
-const lineClient = new line.Client(lineConfig);
+const lineClient = new Client(lineConfig);
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
 /* =========================
- * 鐵律：箱/件不互轉（只解析）
+ * 出庫指令解析（只解析，不互轉）
  * ========================= */
 
 function normalizeText_(s) {
@@ -100,7 +100,6 @@ function parseOutCommand(input) {
 }
 
 function formatOutParseReply(r) {
-  if (!r?.ok) return '指令格式：出3箱2件 / 出3箱 / 出2件（不要加多餘文字）';
   const b = r.boxQty || 0;
   const p = r.pieceQty || 0;
   if (b > 0 && p > 0) return `✅ 解析：出庫 ${b} 箱 + ${p} 件\n請輸入 SKU（例如：a564）`;
@@ -121,17 +120,16 @@ function getTaipeiTodayDateString_() {
   const y = parts.find(p => p.type === 'year')?.value;
   const m = parts.find(p => p.type === 'month')?.value;
   const d = parts.find(p => p.type === 'day')?.value;
-  return `${y}-${m}-${d}`; // YYYY-MM-DD
+  return `${y}-${m}-${d}`;
 }
 
 /* =========================
  * webhook 去重（避免重送/併發）
  * ========================= */
-const SEEN_EVENT = new Map(); // id -> ts
+const SEEN_EVENT = new Map();
 function seenEvent_(id) {
   if (!id) return false;
   const now = Date.now();
-  // 清 10 分鐘前
   for (const [k, ts] of SEEN_EVENT.entries()) {
     if (now - ts > 10 * 60 * 1000) SEEN_EVENT.delete(k);
   }
@@ -143,7 +141,7 @@ function seenEvent_(id) {
 /* =========================
  * 狀態機（每個對話來源一份）
  * ========================= */
-const STATE = new Map(); // key -> { step, out, sku }
+const STATE = new Map();
 
 function getActorKey_(ev) {
   const s = ev.source || {};
@@ -166,7 +164,6 @@ function setState_(key, next) {
 function getState_(key) {
   const st = STATE.get(key);
   if (!st) return null;
-  // 30 分鐘過期
   if (Date.now() - (st.updatedAt || 0) > 30 * 60 * 1000) {
     STATE.delete(key);
     return null;
@@ -190,10 +187,10 @@ async function rpcFifoOutAndLog_({ groupCode, sku, warehouseCode, outBox, outPie
   const { data, error } = await supabase.rpc('fifo_out_and_log', {
     p_group: groupCode,
     p_product_sku: sku,
-    p_warehouse_name: warehouseCode, // 注意：這裡傳 warehouse_code（main/withdraw/swap）
+    p_warehouse_name: warehouseCode, // 傳 warehouse_code（main/withdraw/swap）
     p_out_box: outBox,
     p_out_piece: outPiece,
-    p_at: atIso, // timestamptz
+    p_at: atIso,
     p_created_by: createdBy,
   });
   if (error) throw error;
@@ -201,10 +198,9 @@ async function rpcFifoOutAndLog_({ groupCode, sku, warehouseCode, outBox, outPie
 }
 
 /* =========================
- * LINE 回覆工具
+ * LINE Quick Reply
  * ========================= */
 function buildWarehouseQuickReply_(items) {
-  // items: [{ label, data }]
   return {
     items: items.slice(0, 13).map(it => ({
       type: 'action',
@@ -219,15 +215,13 @@ function buildWarehouseQuickReply_(items) {
 }
 
 /* =========================
- * 主流程
+ * Handlers
  * ========================= */
 async function handleTextMessage(ev) {
   const actorKey = getActorKey_(ev);
   const createdBy = getCreatedBy_(ev);
-  const text = ev.message?.text ?? '';
-  const msg = normalizeText_(text);
+  const msg = normalizeText_(ev.message?.text ?? '');
 
-  // 允許取消
   if (msg === '取消' || msg === 'cancel' || msg === 'c') {
     clearState_(actorKey);
     await lineClient.replyMessage(ev.replyToken, { type: 'text', text: '已取消。' });
@@ -236,7 +230,7 @@ async function handleTextMessage(ev) {
 
   const st = getState_(actorKey);
 
-  // step1：解析出庫指令
+  // 1) 解析出庫
   const parsed = parseOutCommand(msg);
   if (parsed.ok) {
     setState_(actorKey, { step: 'await_sku', out: { boxQty: parsed.boxQty, pieceQty: parsed.pieceQty } });
@@ -244,7 +238,7 @@ async function handleTextMessage(ev) {
     return;
   }
 
-  // step2：等 SKU
+  // 2) 等 SKU
   if (st?.step === 'await_sku') {
     const sku = msg.toLowerCase();
     if (!/^[a-z0-9_]+$/.test(sku)) {
@@ -264,10 +258,9 @@ async function handleTextMessage(ev) {
       return;
     }
 
-    // 只給有庫存的倉（box>0 或 piece>0）
     const available = skuRows
       .map(r => ({
-        warehouse_code: r.warehouse_code,
+        warehouse_code: String(r.warehouse_code || '').toLowerCase(),
         warehouse_name: r.warehouse_name,
         box: Number(r.box ?? 0),
         piece: Number(r.piece ?? 0),
@@ -275,10 +268,7 @@ async function handleTextMessage(ev) {
       .filter(r => r.box > 0 || r.piece > 0);
 
     if (!available.length) {
-      await lineClient.replyMessage(ev.replyToken, {
-        type: 'text',
-        text: `此 SKU 當日庫存為 0：${sku}\n或輸入「取消」。`,
-      });
+      await lineClient.replyMessage(ev.replyToken, { type: 'text', text: `此 SKU 當日庫存為 0：${sku}\n或輸入「取消」。` });
       return;
     }
 
@@ -297,31 +287,25 @@ async function handleTextMessage(ev) {
       text: `✅ SKU：${sku}\n請選擇倉庫：\n${lines.join('\n')}\n（或輸入「取消」）`,
       quickReply: qr,
     });
-    return;
   }
-
-  // 其他文字不處理
 }
 
 async function handlePostback(ev) {
   const actorKey = getActorKey_(ev);
   const createdBy = getCreatedBy_(ev);
   const st = getState_(actorKey);
-  if (!st?.step || st.step !== 'await_wh') return;
+  if (!st || st.step !== 'await_wh') return;
 
   const data = ev.postback?.data || '';
   const params = new URLSearchParams(data);
-  const act = params.get('act');
-  if (act !== 'pick_wh') return;
+  if (params.get('act') !== 'pick_wh') return;
 
-  const wh = (params.get('wh') || '').toLowerCase();
+  const wh = String(params.get('wh') || '').toLowerCase();
   if (!wh) return;
 
   const outBox = Number(st.out?.boxQty ?? 0);
   const outPiece = Number(st.out?.pieceQty ?? 0);
-
-  // 直接扣庫（先不做 confirm，避免多一步；要 confirm 我再幫你加）
-  const atIso = new Date().toISOString(); // timestamptz
+  const atIso = new Date().toISOString();
 
   try {
     await rpcFifoOutAndLog_({
@@ -334,11 +318,11 @@ async function handlePostback(ev) {
       createdBy,
     });
 
-    // 扣完立刻 requery 快照回覆最新庫存（方案A：台北當天）
     const bizDate = getTaipeiTodayDateString_();
     const rows = await rpcGetBusinessDayStock_(GROUP_CODE, bizDate);
-    const skuRows = rows.filter(r => String(r.product_sku || '').toLowerCase() === st.sku);
-    const picked = skuRows.find(r => String(r.warehouse_code || '').toLowerCase() === wh);
+    const picked = rows.find(
+      r => String(r.product_sku || '').toLowerCase() === st.sku && String(r.warehouse_code || '').toLowerCase() === wh
+    );
 
     clearState_(actorKey);
 
@@ -359,14 +343,13 @@ async function handlePostback(ev) {
     clearState_(actorKey);
     await lineClient.replyMessage(ev.replyToken, {
       type: 'text',
-      text: `❌ 出庫失敗：${(err && err.message) ? err.message : 'unknown error'}`,
+      text: `❌ 出庫失敗：${err?.message ?? 'unknown error'}`,
     });
   }
 }
 
 async function handleEvent(ev) {
   try {
-    // 去重（若 LINE 有給 webhookEventId）
     const wid = ev.webhookEventId || ev?.deliveryContext?.eventId;
     if (seenEvent_(wid)) return;
 
@@ -374,10 +357,8 @@ async function handleEvent(ev) {
       await handleTextMessage(ev);
       return;
     }
-
     if (ev.type === 'postback') {
       await handlePostback(ev);
-      return;
     }
   } catch (err) {
     console.error('[handleEvent error]', err);
@@ -388,12 +369,10 @@ async function handleEvent(ev) {
  * Routes
  * ========================= */
 
-app.get('/health', (req, res) => {
-  res.status(200).send('ok');
-});
+app.get('/health', (req, res) => res.status(200).send('ok'));
 
 app.post('/webhook', middleware(lineConfig), (req, res) => {
-  // 鐵律：立刻回 200，避免 LINE webhook 重送
+  // 鐵律：立刻回 200
   res.sendStatus(200);
 
   const events = req.body?.events ?? [];
