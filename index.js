@@ -21,7 +21,7 @@ const {
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) throw new Error('Missing LINE env');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing Supabase env');
 
-const BOT_VER = 'V2026-01-17_CMD_BARCODE_STUB';
+const BOT_VER = 'V2026-01-17_CMD_BARCODE_OK';
 
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
@@ -172,7 +172,49 @@ function getLastWh_(actorKey) {
 }
 
 /* =========================
- * command parser (加上「條碼」)
+ * barcode lookup (NEW)
+ * products: product_sku, product_name, units_per_box, created_at, barcode
+ * ========================= */
+function normalizeBarcode_(s) {
+  return String(s || '').trim();
+}
+
+async function lookupProductsByBarcode_(barcodeRaw) {
+  const barcode = normalizeBarcode_(barcodeRaw);
+  if (!barcode) return [];
+
+  const { data, error } = await supabase
+    .from('products')
+    .select('product_sku, product_name')
+    .eq('barcode', barcode)
+    .limit(10);
+
+  if (error) throw error;
+
+  const rows = Array.isArray(data) ? data : [];
+  return rows
+    .map((r) => ({
+      sku: skuKey_(r.product_sku),
+      name: String(r.product_name || '').trim(),
+    }))
+    .filter((x) => x.sku);
+}
+
+function buildQuickReplyForProducts_(items) {
+  return {
+    items: items.slice(0, 12).map((p) => ({
+      type: 'action',
+      action: {
+        type: 'message',
+        label: `${p.name || p.sku}`.slice(0, 20),
+        text: `編號 ${p.sku}`,
+      },
+    })),
+  };
+}
+
+/* =========================
+ * command parser (含「條碼」)
  * ========================= */
 function parseCommand(text) {
   const t = String(text || '').trim();
@@ -309,8 +351,31 @@ async function getWarehouseSnapshot_(sku, whCode) {
 }
 
 /* =========================
- * command handlers (新增 barcode 指令：目前 DB 無條碼資料 → 回提示)
+ * command handlers (barcode -> 自動導到編號 sku)
  * ========================= */
+async function handleSkuFlow_(ev, sku) {
+  const actorKey = getActorKey_(ev);
+  const s = skuKey_(sku);
+  if (!s) return;
+
+  setLastSku_(actorKey, s);
+
+  const whList = await getWarehousesStockBySku_(s);
+  if (!whList.length) {
+    await safeReplyText_(ev, `無此商品庫存：${s}`);
+    return;
+  }
+
+  if (whList.length >= 2) {
+    await safeReplyText_(ev, `編號：${s}\n👉請選擇倉庫`, buildQuickReplyWarehousesForQuery_(s, whList));
+    return;
+  }
+
+  const chosen = whList[0];
+  setLastWh_(actorKey, chosen.code);
+  await safeReplyText_(ev, `編號：${s}\n倉庫類別：${chosen.label}\n庫存：${chosen.box}箱${chosen.piece}件`);
+}
+
 async function handleCommandMessage_(ev, parsed) {
   const actorKey = getActorKey_(ev);
   const createdBy = getCreatedBy_(ev);
@@ -321,11 +386,24 @@ async function handleCommandMessage_(ev, parsed) {
     return;
   }
 
-  // ✅ 新增：條碼
+  // ✅ 條碼：查 products.barcode -> sku
   if (parsed.type === 'barcode') {
+    const list = await lookupProductsByBarcode_(parsed.barcode);
+
+    if (!list.length) {
+      await safeReplyText_(ev, `無此條碼：${normalizeBarcode_(parsed.barcode)}`);
+      return;
+    }
+
+    if (list.length === 1) {
+      await handleSkuFlow_(ev, list[0].sku);
+      return;
+    }
+
     await safeReplyText_(
       ev,
-      `目前資料庫沒有「條碼→SKU」對照資料（products 也沒有條碼欄位）。\n請先建立一張 product_barcodes 表或在 products 加 barcode 欄位，之後我再把條碼查詢接上。\n你輸入的條碼：${parsed.barcode}`,
+      `條碼找到多筆，請選擇商品`,
+      buildQuickReplyForProducts_(list.map((x) => ({ sku: x.sku, name: x.name || x.sku }))),
     );
     return;
   }
@@ -336,25 +414,7 @@ async function handleCommandMessage_(ev, parsed) {
   }
 
   if (parsed.type === 'sku') {
-    const sku = skuKey_(parsed.sku);
-    if (!sku) return;
-
-    setLastSku_(actorKey, sku);
-
-    const whList = await getWarehousesStockBySku_(sku);
-    if (!whList.length) {
-      await safeReplyText_(ev, `無此商品庫存：${sku}`);
-      return;
-    }
-
-    if (whList.length >= 2) {
-      await safeReplyText_(ev, `編號：${sku}\n👉請選擇倉庫`, buildQuickReplyWarehousesForQuery_(sku, whList));
-      return;
-    }
-
-    const chosen = whList[0];
-    setLastWh_(actorKey, chosen.code);
-    await safeReplyText_(ev, `編號：${sku}\n倉庫類別：${chosen.label}\n庫存：${chosen.box}箱${chosen.piece}件`);
+    await handleSkuFlow_(ev, parsed.sku);
     return;
   }
 
