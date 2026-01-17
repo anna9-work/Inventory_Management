@@ -22,7 +22,7 @@ const {
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) throw new Error('Missing LINE env');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing Supabase env');
 
-const BOT_VER = 'V2026-01-17_PUSH_GAS_AND_PIECE_UNITS';
+const BOT_VER = 'V2026-01-17_DB_DEDUP_PUSH_GAS_PIECE_UNITS';
 
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
@@ -111,10 +111,9 @@ function getGasCallUrl_() {
 
 async function postToGAS_(payload) {
   const url = getGasCallUrl_();
-  if (!url) return; // 沒設定就略過
+  if (!url) return;
 
   try {
-    // Node 22 有內建 fetch
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -130,7 +129,6 @@ async function postToGAS_(payload) {
 }
 
 function fireAndForgetGas_(payload) {
-  // 不 await，避免影響出庫回覆
   postToGAS_(payload).catch(() => {});
 }
 
@@ -158,6 +156,35 @@ async function rpcFifoOutAndLog_({ groupCode, sku, warehouseCode, outBox, outPie
   });
   if (error) throw error;
   return data;
+}
+
+/* =========================
+ * DB dedup (跨重啟/多 instance)
+ * ========================= */
+async function acquireEventDedup_(eventId, ev) {
+  const id = String(eventId || '').trim();
+  if (!id) return true; // 沒有 id 就不擋（極少）
+
+  const payload = {
+    event_id: id,
+    group_code: String(GROUP_CODE || '').trim().toLowerCase(),
+    line_user_id: ev?.source?.userId || null,
+    event_type: ev?.type || null,
+  };
+
+  const { error } = await supabase.from('line_event_dedup').insert(payload);
+
+  if (!error) return true;
+
+  // 23505 = unique_violation (primary key)
+  if (String(error.code) === '23505') {
+    console.log('[DEDUP] duplicated event_id => skip', id);
+    return false;
+  }
+
+  // 其他錯誤：不要擋主流程（避免 dedup 表出問題導致 bot 全死）
+  console.warn('[DEDUP WARN] insert failed, allow continue:', error?.message || error);
+  return true;
 }
 
 /* =========================
@@ -321,7 +348,7 @@ async function searchInTodayStock_(group, keywordRaw) {
 
 /* =========================
  * command parser
- * 出1 / 出1件 / 出1個 / 出1散  -> 都視為「件數」
+ * 出1 / 出1件 / 出1個 / 出1散 -> 都是件數
  * 出1（無單位） -> 視為 1件
  * ========================= */
 function parseCommand(text) {
@@ -347,7 +374,6 @@ function parseCommand(text) {
   const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
-  // 出庫：箱/件（件=件/個/散），無單位但有數字 -> 視為件
   const mChange = t.match(
     /^(出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?\s*(?:(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/,
   );
@@ -359,7 +385,6 @@ function parseCommand(text) {
     const rawHasDigit = /\d+/.test(t);
     const hasBoxOrPieceUnit = /箱|個|散|件/.test(t);
 
-    // ✅ 無單位但有數字、且沒有箱 -> 視為件數（出1 -> 1件）
     const piece =
       pieceLabeled ||
       pieceTail ||
@@ -434,7 +459,7 @@ function buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList) {
 }
 
 /* =========================
- * stock helpers by sku (for 編號/出庫)
+ * stock helpers by sku
  * ========================= */
 async function getWarehousesStockBySku_(sku) {
   const bizDate = getBizDate0500TPE_();
@@ -513,17 +538,14 @@ async function handleCommandMessage_(ev, parsed) {
 
   if (parsed.type === 'barcode') {
     const list = await lookupProductsByBarcode_(parsed.barcode);
-
     if (!list.length) {
       await safeReplyText_(ev, `無此條碼：${normalizeBarcode_(parsed.barcode)}`);
       return;
     }
-
     if (list.length === 1) {
       await handleSkuFlow_(ev, list[0].sku);
       return;
     }
-
     await safeReplyText_(
       ev,
       `條碼找到多筆，請選擇商品`,
@@ -543,7 +565,6 @@ async function handleCommandMessage_(ev, parsed) {
       await safeReplyText_(ev, '請先用「查 xxx」或「編號 a564」選定商品，再選倉庫');
       return;
     }
-
     const whCode = getWarehouseCodeForLabel_(parsed.warehouse);
     setLastWh_(actorKey, whCode);
 
@@ -556,7 +577,7 @@ async function handleCommandMessage_(ev, parsed) {
     const outBox = Number(parsed.box || 0);
     const outPiece = Number(parsed.piece || 0);
     if (outBox === 0 && outPiece === 0) {
-      await safeReplyText_(ev, '指令格式：出3箱2件 / 出3箱 / 出2件（出1 / 出1個 / 出1散 都視為 1件）');
+      await safeReplyText_(ev, '指令格式：出3箱2件 / 出3箱 / 出2件（出1/出1個/出1散 都視為件）');
       return;
     }
 
@@ -573,7 +594,6 @@ async function handleCommandMessage_(ev, parsed) {
     }
 
     let chosenWhCode = null;
-
     if (parsed.warehouse) {
       chosenWhCode = getWarehouseCodeForLabel_(parsed.warehouse);
     } else {
@@ -589,7 +609,6 @@ async function handleCommandMessage_(ev, parsed) {
       chosenWhCode = whList[0].code;
     }
 
-    // 出庫前 requery 防超扣（箱對箱、件對件，不做換算）
     const snapBefore = await getWarehouseSnapshot_(sku, chosenWhCode);
     if (outBox > 0 && snapBefore.box < outBox) {
       await safeReplyText_(ev, `庫存不足，無法出庫（倉別：${snapBefore.label}）\n目前庫存：${snapBefore.box}箱${snapBefore.piece}件`);
@@ -620,15 +639,12 @@ async function handleCommandMessage_(ev, parsed) {
 
     setLastWh_(actorKey, chosenWhCode);
 
-    // 出庫後再查一次
     const snapAfter = await getWarehouseSnapshot_(sku, chosenWhCode);
-
     await safeReplyText_(
       ev,
       `✅ 出庫成功\n編號：${sku}\n倉別：${snapAfter.label}\n出庫：${outBox}箱 ${outPiece}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}件`,
     );
 
-    // ✅ 推 GAS：只顯示結果，不算帳
     const gasPayload = {
       type: 'line_outbound',
       group_code: String(GROUP_CODE || '').trim().toLowerCase(),
@@ -647,8 +663,6 @@ async function handleCommandMessage_(ev, parsed) {
       source: 'LINE_OUTBOUND',
     };
     fireAndForgetGas_(gasPayload);
-
-    return;
   }
 }
 
@@ -748,21 +762,11 @@ async function handlePostback_(ev) {
 /* =========================
  * event handling
  * ========================= */
-const SEEN_EVENT = new Map();
-function seenEvent_(id) {
-  if (!id) return false;
-  const now = Date.now();
-  for (const [k, ts] of SEEN_EVENT.entries()) {
-    if (now - ts > 10 * 60 * 1000) SEEN_EVENT.delete(k);
-  }
-  if (SEEN_EVENT.has(id)) return true;
-  SEEN_EVENT.set(id, now);
-  return false;
-}
-
 async function handleEvent_(ev) {
-  const wid = ev.webhookEventId || ev?.deliveryContext?.eventId;
-  if (seenEvent_(wid)) return;
+  // ✅ 先做 DB 去重（跨重啟/多 instance）
+  const eventId = ev.webhookEventId || ev?.deliveryContext?.eventId || '';
+  const ok = await acquireEventDedup_(eventId, ev);
+  if (!ok) return;
 
   if (ev.type === 'postback') {
     await handlePostback_(ev);
@@ -784,6 +788,7 @@ async function handleEvent_(ev) {
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 app.post('/webhook', middleware(lineConfig), (req, res) => {
+  // 鐵律：立刻回 200，避免 LINE 重送
   res.sendStatus(200);
 
   const events = req.body?.events ?? [];
