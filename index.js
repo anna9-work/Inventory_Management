@@ -1,4 +1,3 @@
-// index.js
 import 'dotenv/config';
 import express from 'express';
 import { middleware, Client } from '@line/bot-sdk';
@@ -16,12 +15,14 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
   GROUP_CODE = 'catch_0001',
+  GAS_WEBHOOK_URL = '',
+  GAS_WEBHOOK_SECRET = '',
 } = process.env;
 
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) throw new Error('Missing LINE env');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing Supabase env');
 
-const BOT_VER = 'V2026-01-17_CMD_BARCODE_OK';
+const BOT_VER = 'V2026-01-17_PUSH_GAS_AND_PIECE_UNITS';
 
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
@@ -35,7 +36,7 @@ const supabase = createClient(String(SUPABASE_URL).replace(/\/+$/, ''), SUPABASE
 });
 
 /* =========================
- * helpers (non-command)
+ * helpers
  * ========================= */
 function getSupabaseHost_() {
   try {
@@ -62,6 +63,14 @@ async function safeReplyText_(ev, text, quickReply = undefined) {
   }
 }
 
+function skuKey_(s) {
+  return String(s || '').trim().toLowerCase();
+}
+function pickNum_(v, fb = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fb;
+}
+
 /* =========================
  * time: 05:00 biz_date (TPE)
  * ========================= */
@@ -75,8 +84,58 @@ function getBizDate0500TPE_() {
   }).format(d);
 }
 
+function tpeNowISO_() {
+  const s = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date());
+  return s.replace(' ', 'T') + '+08:00';
+}
+
 /* =========================
- * stock rpc
+ * GAS push (fire-and-forget)
+ * ========================= */
+function getGasCallUrl_() {
+  const base = String(GAS_WEBHOOK_URL || '').trim();
+  const secret = String(GAS_WEBHOOK_SECRET || '').trim();
+  if (!base || !secret) return null;
+  const clean = base.replace(/\?.*$/, '');
+  return `${clean}?secret=${encodeURIComponent(secret)}`;
+}
+
+async function postToGAS_(payload) {
+  const url = getGasCallUrl_();
+  if (!url) return; // 沒設定就略過
+
+  try {
+    // Node 22 有內建 fetch
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.warn('[GAS WARN]', res.status, txt.slice(0, 300));
+    }
+  } catch (e) {
+    console.warn('[GAS ERROR]', e?.message || e);
+  }
+}
+
+function fireAndForgetGas_(payload) {
+  // 不 await，避免影響出庫回覆
+  postToGAS_(payload).catch(() => {});
+}
+
+/* =========================
+ * RPC
  * ========================= */
 async function rpcGetBusinessDayStock_(groupCode, bizDateStr) {
   const { data, error } = await supabase.rpc('get_business_day_stock', {
@@ -112,13 +171,6 @@ const FIX_CODE_TO_NAME = new Map([
   ['unspecified', '未指定'],
 ]);
 
-function skuKey_(s) {
-  return String(s || '').trim().toLowerCase();
-}
-function pickNum_(v, fb = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fb;
-}
 function resolveWarehouseLabel_(codeOrName) {
   const k = String(codeOrName || '').trim();
   if (!k) return '未指定';
@@ -172,8 +224,7 @@ function getLastWh_(actorKey) {
 }
 
 /* =========================
- * barcode lookup (NEW)
- * products: product_sku, product_name, units_per_box, created_at, barcode
+ * barcode lookup (products.barcode)
  * ========================= */
 function normalizeBarcode_(s) {
   return String(s || '').trim();
@@ -200,6 +251,38 @@ async function lookupProductsByBarcode_(barcodeRaw) {
     .filter((x) => x.sku);
 }
 
+/* =========================
+ * TODAY STOCK LIST cache (for 查/查詢)
+ * ========================= */
+const STOCK_LIST_CACHE = new Map(); // key = `${group}::${bizDate}` -> { ts, rows }
+const STOCK_LIST_TTL_MS = 3000;
+
+function getStockCacheKey_(group, bizDate) {
+  return `${String(group || '').trim().toLowerCase()}::${bizDate}`;
+}
+
+async function getTodayStockRows_(group) {
+  const bizDate = getBizDate0500TPE_();
+  const key = getStockCacheKey_(group, bizDate);
+  const cached = STOCK_LIST_CACHE.get(key);
+  if (cached && Date.now() - cached.ts < STOCK_LIST_TTL_MS) return cached.rows;
+
+  const rows = await rpcGetBusinessDayStock_(group, bizDate);
+
+  const kept = rows
+    .map((r) => {
+      const sku = skuKey_(r.product_sku || r['貨品編號']);
+      const name = String(r.product_name || r['貨品名稱'] || '').trim();
+      const box = pickNum_(r.box ?? r['庫存箱數'] ?? 0, 0);
+      const piece = pickNum_(r.piece ?? r['庫存散數'] ?? 0, 0);
+      return { sku, name, box, piece };
+    })
+    .filter((x) => x.sku && (x.box > 0 || x.piece > 0));
+
+  STOCK_LIST_CACHE.set(key, { ts: Date.now(), rows: kept });
+  return kept;
+}
+
 function buildQuickReplyForProducts_(items) {
   return {
     items: items.slice(0, 12).map((p) => ({
@@ -213,8 +296,33 @@ function buildQuickReplyForProducts_(items) {
   };
 }
 
+async function searchInTodayStock_(group, keywordRaw) {
+  const kw = String(keywordRaw || '').trim();
+  if (!kw) return [];
+
+  const kwLower = kw.toLowerCase();
+  const rows = await getTodayStockRows_(group);
+
+  const seen = new Set();
+  const out = [];
+
+  for (const r of rows) {
+    if (!r.sku || seen.has(r.sku)) continue;
+    const nameLower = String(r.name || '').toLowerCase();
+    const skuLower = String(r.sku || '').toLowerCase();
+    if (nameLower.includes(kwLower) || skuLower.includes(kwLower)) {
+      seen.add(r.sku);
+      out.push({ sku: r.sku, name: r.name || r.sku });
+      if (out.length >= 10) break;
+    }
+  }
+  return out;
+}
+
 /* =========================
- * command parser (含「條碼」)
+ * command parser
+ * 出1 / 出1件 / 出1個 / 出1散  -> 都視為「件數」
+ * 出1（無單位） -> 視為 1件
  * ========================= */
 function parseCommand(text) {
   const t = String(text || '').trim();
@@ -239,6 +347,7 @@ function parseCommand(text) {
   const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
+  // 出庫：箱/件（件=件/個/散），無單位但有數字 -> 視為件
   const mChange = t.match(
     /^(出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?\s*(?:(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/,
   );
@@ -249,6 +358,8 @@ function parseCommand(text) {
 
     const rawHasDigit = /\d+/.test(t);
     const hasBoxOrPieceUnit = /箱|個|散|件/.test(t);
+
+    // ✅ 無單位但有數字、且沒有箱 -> 視為件數（出1 -> 1件）
     const piece =
       pieceLabeled ||
       pieceTail ||
@@ -323,7 +434,7 @@ function buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList) {
 }
 
 /* =========================
- * stock helpers
+ * stock helpers by sku (for 編號/出庫)
  * ========================= */
 async function getWarehousesStockBySku_(sku) {
   const bizDate = getBizDate0500TPE_();
@@ -351,7 +462,7 @@ async function getWarehouseSnapshot_(sku, whCode) {
 }
 
 /* =========================
- * command handlers (barcode -> 自動導到編號 sku)
+ * handlers
  * ========================= */
 async function handleSkuFlow_(ev, sku) {
   const actorKey = getActorKey_(ev);
@@ -386,7 +497,20 @@ async function handleCommandMessage_(ev, parsed) {
     return;
   }
 
-  // ✅ 條碼：查 products.barcode -> sku
+  if (parsed.type === 'query') {
+    const list = await searchInTodayStock_(GROUP_CODE, parsed.keyword);
+    if (!list.length) {
+      await safeReplyText_(ev, `無此商品庫存（只查當日有庫存清單）\n關鍵字：${parsed.keyword}`);
+      return;
+    }
+    if (list.length === 1) {
+      await handleSkuFlow_(ev, list[0].sku);
+      return;
+    }
+    await safeReplyText_(ev, `找到以下品項（只含當日有庫存）`, buildQuickReplyForProducts_(list));
+    return;
+  }
+
   if (parsed.type === 'barcode') {
     const list = await lookupProductsByBarcode_(parsed.barcode);
 
@@ -408,11 +532,6 @@ async function handleCommandMessage_(ev, parsed) {
     return;
   }
 
-  if (parsed.type === 'query') {
-    await safeReplyText_(ev, `目前未開放「查詢」；請用「編號 a564」或「#a564」指定 SKU`);
-    return;
-  }
-
   if (parsed.type === 'sku') {
     await handleSkuFlow_(ev, parsed.sku);
     return;
@@ -421,7 +540,7 @@ async function handleCommandMessage_(ev, parsed) {
   if (parsed.type === 'wh_select') {
     const sku = getLastSku_(actorKey);
     if (!sku) {
-      await safeReplyText_(ev, '請先用「編號 a564」或「#a564」選定商品，再選倉庫');
+      await safeReplyText_(ev, '請先用「查 xxx」或「編號 a564」選定商品，再選倉庫');
       return;
     }
 
@@ -437,13 +556,13 @@ async function handleCommandMessage_(ev, parsed) {
     const outBox = Number(parsed.box || 0);
     const outPiece = Number(parsed.piece || 0);
     if (outBox === 0 && outPiece === 0) {
-      await safeReplyText_(ev, '指令格式：出3箱2件 / 出3箱 / 出2件（出1 會視為 1件）');
+      await safeReplyText_(ev, '指令格式：出3箱2件 / 出3箱 / 出2件（出1 / 出1個 / 出1散 都視為 1件）');
       return;
     }
 
     const sku = getLastSku_(actorKey);
     if (!sku) {
-      await safeReplyText_(ev, '請先用「編號 a564」或「#a564」選定「有庫存」商品後再出庫');
+      await safeReplyText_(ev, '請先用「查 xxx」或「編號 a564」選定「有庫存」商品後再出庫');
       return;
     }
 
@@ -470,6 +589,7 @@ async function handleCommandMessage_(ev, parsed) {
       chosenWhCode = whList[0].code;
     }
 
+    // 出庫前 requery 防超扣（箱對箱、件對件，不做換算）
     const snapBefore = await getWarehouseSnapshot_(sku, chosenWhCode);
     if (outBox > 0 && snapBefore.box < outBox) {
       await safeReplyText_(ev, `庫存不足，無法出庫（倉別：${snapBefore.label}）\n目前庫存：${snapBefore.box}箱${snapBefore.piece}件`);
@@ -480,6 +600,8 @@ async function handleCommandMessage_(ev, parsed) {
       return;
     }
 
+    const atIso = new Date().toISOString();
+
     try {
       await rpcFifoOutAndLog_({
         groupCode: GROUP_CODE,
@@ -487,7 +609,7 @@ async function handleCommandMessage_(ev, parsed) {
         warehouseCode: chosenWhCode,
         outBox,
         outPiece,
-        atIso: new Date().toISOString(),
+        atIso,
         createdBy,
       });
     } catch (e) {
@@ -498,31 +620,44 @@ async function handleCommandMessage_(ev, parsed) {
 
     setLastWh_(actorKey, chosenWhCode);
 
+    // 出庫後再查一次
     const snapAfter = await getWarehouseSnapshot_(sku, chosenWhCode);
+
     await safeReplyText_(
       ev,
       `✅ 出庫成功\n編號：${sku}\n倉別：${snapAfter.label}\n出庫：${outBox}箱 ${outPiece}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}件`,
     );
+
+    // ✅ 推 GAS：只顯示結果，不算帳
+    const gasPayload = {
+      type: 'line_outbound',
+      group_code: String(GROUP_CODE || '').trim().toLowerCase(),
+      product_sku: sku,
+      warehouse_code: chosenWhCode,
+      warehouse_name: snapAfter.label,
+      out_box: outBox,
+      out_piece: outPiece,
+      stock_box: Number(snapAfter.box || 0),
+      stock_piece: Number(snapAfter.piece || 0),
+      at: atIso,
+      tpe_time: tpeNowISO_(),
+      biz_date_0500: getBizDate0500TPE_(),
+      bot_ver: BOT_VER,
+      db_host: SUPA_HOST,
+      source: 'LINE_OUTBOUND',
+    };
+    fireAndForgetGas_(gasPayload);
+
+    return;
   }
 }
 
 /* =========================
- * event handling
+ * postback handlers
  * ========================= */
-const SEEN_EVENT = new Map();
-function seenEvent_(id) {
-  if (!id) return false;
-  const now = Date.now();
-  for (const [k, ts] of SEEN_EVENT.entries()) {
-    if (now - ts > 10 * 60 * 1000) SEEN_EVENT.delete(k);
-  }
-  if (SEEN_EVENT.has(id)) return true;
-  SEEN_EVENT.set(id, now);
-  return false;
-}
-
 async function handlePostback_(ev) {
   const actorKey = getActorKey_(ev);
+  const createdBy = getCreatedBy_(ev);
 
   const pb = parsePostback(ev?.postback?.data);
   if (!pb) return;
@@ -530,7 +665,7 @@ async function handlePostback_(ev) {
   if (pb.type === 'wh_select_postback') {
     const sku = pb.sku || getLastSku_(actorKey);
     if (!sku) {
-      await safeReplyText_(ev, '請先用「編號 a564」或「#a564」選定商品，再選倉庫');
+      await safeReplyText_(ev, '請先用「查 xxx」或「編號 a564」選定商品，再選倉庫');
       return;
     }
     const whCode = getWarehouseCodeForLabel_(pb.wh);
@@ -543,10 +678,9 @@ async function handlePostback_(ev) {
   }
 
   if (pb.type === 'out_postback') {
-    const createdBy = getCreatedBy_(ev);
     const sku = pb.sku || getLastSku_(actorKey);
     if (!sku) {
-      await safeReplyText_(ev, '請先用「編號 a564」或「#a564」選定商品後再出庫');
+      await safeReplyText_(ev, '請先用「查 xxx」或「編號 a564」選定商品後再出庫');
       return;
     }
     const whCode = getWarehouseCodeForLabel_(pb.wh);
@@ -563,6 +697,8 @@ async function handlePostback_(ev) {
       return;
     }
 
+    const atIso = new Date().toISOString();
+
     try {
       await rpcFifoOutAndLog_({
         groupCode: GROUP_CODE,
@@ -570,7 +706,7 @@ async function handlePostback_(ev) {
         warehouseCode: whCode,
         outBox,
         outPiece,
-        atIso: new Date().toISOString(),
+        atIso,
         createdBy,
       });
     } catch (e) {
@@ -587,7 +723,41 @@ async function handlePostback_(ev) {
       ev,
       `✅ 出庫成功\n編號：${sku}\n倉別：${snapAfter.label}\n出庫：${outBox}箱 ${outPiece}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}件`,
     );
+
+    const gasPayload = {
+      type: 'line_outbound',
+      group_code: String(GROUP_CODE || '').trim().toLowerCase(),
+      product_sku: sku,
+      warehouse_code: whCode,
+      warehouse_name: snapAfter.label,
+      out_box: outBox,
+      out_piece: outPiece,
+      stock_box: Number(snapAfter.box || 0),
+      stock_piece: Number(snapAfter.piece || 0),
+      at: atIso,
+      tpe_time: tpeNowISO_(),
+      biz_date_0500: getBizDate0500TPE_(),
+      bot_ver: BOT_VER,
+      db_host: SUPA_HOST,
+      source: 'LINE_OUTBOUND',
+    };
+    fireAndForgetGas_(gasPayload);
   }
+}
+
+/* =========================
+ * event handling
+ * ========================= */
+const SEEN_EVENT = new Map();
+function seenEvent_(id) {
+  if (!id) return false;
+  const now = Date.now();
+  for (const [k, ts] of SEEN_EVENT.entries()) {
+    if (now - ts > 10 * 60 * 1000) SEEN_EVENT.delete(k);
+  }
+  if (SEEN_EVENT.has(id)) return true;
+  SEEN_EVENT.set(id, now);
+  return false;
 }
 
 async function handleEvent_(ev) {
@@ -624,5 +794,7 @@ app.post('/webhook', middleware(lineConfig), (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LINE Bot server running on port ${PORT} ver=${BOT_VER} db_host=${SUPA_HOST}`);
+  console.log(
+    `LINE Bot server running on port ${PORT} ver=${BOT_VER} db_host=${SUPA_HOST} gas=${getGasCallUrl_() ? 'on' : 'off'}`,
+  );
 });
