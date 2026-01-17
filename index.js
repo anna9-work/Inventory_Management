@@ -14,7 +14,7 @@ const {
   LINE_CHANNEL_ACCESS_TOKEN,
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
-  GROUP_CODE = 'catch_0001'
+  GROUP_CODE = 'catch_0001',
 } = process.env;
 
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) {
@@ -36,9 +36,30 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 });
 
 /* =========================
+ * Reply helper（reply 失敗就 push）
+ * ========================= */
+async function safeReplyText_(ev, text) {
+  const to = ev?.source?.userId;
+  try {
+    await lineClient.replyMessage(ev.replyToken, { type: 'text', text });
+  } catch (e) {
+    console.error('[LINE replyMessage failed]', e?.message || e, {
+      replyToken: ev?.replyToken,
+      to,
+    });
+    if (to) {
+      try {
+        await lineClient.pushMessage(to, { type: 'text', text });
+      } catch (e2) {
+        console.error('[LINE pushMessage failed]', e2?.message || e2, { to });
+      }
+    }
+  }
+}
+
+/* =========================
  * 出庫指令解析（只解析，不互轉）
  * ========================= */
-
 function normalizeText_(s) {
   if (typeof s !== 'string') return '';
   return s
@@ -55,6 +76,10 @@ function parsePositiveInt_(raw) {
   const n = Number(s);
   if (!Number.isSafeInteger(n) || n <= 0) return null;
   return n;
+}
+
+function isOutPrefix_(text) {
+  return /^(出庫|出)\b/i.test(text) || /^(出庫|出)\s*/i.test(text);
 }
 
 function parseOutCommand(input) {
@@ -105,6 +130,10 @@ function formatOutParseReply(r) {
   if (b > 0 && p > 0) return `✅ 解析：出庫 ${b} 箱 + ${p} 件\n請輸入 SKU（例如：a564）`;
   if (b > 0) return `✅ 解析：出庫 ${b} 箱\n請輸入 SKU（例如：a564）`;
   return `✅ 解析：出庫 ${p} 件\n請輸入 SKU（例如：a564）`;
+}
+
+function formatOutHelp_() {
+  return '指令格式：出3箱2件 / 出3箱 / 出2件（一定要帶「箱」或「件」）';
 }
 
 /* =========================
@@ -219,22 +248,33 @@ function buildWarehouseQuickReply_(items) {
  * ========================= */
 async function handleTextMessage(ev) {
   const actorKey = getActorKey_(ev);
-  const createdBy = getCreatedBy_(ev);
   const msg = normalizeText_(ev.message?.text ?? '');
 
   if (msg === '取消' || msg === 'cancel' || msg === 'c') {
     clearState_(actorKey);
-    await lineClient.replyMessage(ev.replyToken, { type: 'text', text: '已取消。' });
+    await safeReplyText_(ev, '已取消。');
     return;
   }
 
   const st = getState_(actorKey);
 
-  // 1) 解析出庫
+  // 0) 以「出/出庫」開頭但解析失敗 → 回提示（你現在的「出1」就會回）
+  if (isOutPrefix_(msg)) {
+    const parsed0 = parseOutCommand(msg);
+    if (!parsed0.ok) {
+      await safeReplyText_(ev, formatOutHelp_());
+      return;
+    }
+  }
+
+  // 1) 解析出庫（成功就進 await_sku）
   const parsed = parseOutCommand(msg);
   if (parsed.ok) {
-    setState_(actorKey, { step: 'await_sku', out: { boxQty: parsed.boxQty, pieceQty: parsed.pieceQty } });
-    await lineClient.replyMessage(ev.replyToken, { type: 'text', text: formatOutParseReply(parsed) });
+    setState_(actorKey, {
+      step: 'await_sku',
+      out: { boxQty: parsed.boxQty, pieceQty: parsed.pieceQty },
+    });
+    await safeReplyText_(ev, formatOutParseReply(parsed));
     return;
   }
 
@@ -242,7 +282,7 @@ async function handleTextMessage(ev) {
   if (st?.step === 'await_sku') {
     const sku = msg.toLowerCase();
     if (!/^[a-z0-9_]+$/.test(sku)) {
-      await lineClient.replyMessage(ev.replyToken, { type: 'text', text: 'SKU 格式不對（例：a564）。或輸入「取消」。' });
+      await safeReplyText_(ev, 'SKU 格式不對（例：a564）。或輸入「取消」。');
       return;
     }
 
@@ -251,13 +291,11 @@ async function handleTextMessage(ev) {
 
     const skuRows = rows.filter(r => String(r.product_sku || '').toLowerCase() === sku);
     if (!skuRows.length) {
-      await lineClient.replyMessage(ev.replyToken, {
-        type: 'text',
-        text: `找不到此 SKU 的當日庫存：${sku}\n請確認 SKU，或輸入「取消」。`,
-      });
+      await safeReplyText_(ev, `找不到此 SKU 的當日庫存：${sku}\n請確認 SKU，或輸入「取消」。`);
       return;
     }
 
+    // 每個倉庫的庫存（只保留有庫存的倉）
     const available = skuRows
       .map(r => ({
         warehouse_code: String(r.warehouse_code || '').toLowerCase(),
@@ -268,11 +306,17 @@ async function handleTextMessage(ev) {
       .filter(r => r.box > 0 || r.piece > 0);
 
     if (!available.length) {
-      await lineClient.replyMessage(ev.replyToken, { type: 'text', text: `此 SKU 當日庫存為 0：${sku}\n或輸入「取消」。` });
+      await safeReplyText_(ev, `此 SKU 當日庫存為 0：${sku}\n或輸入「取消」。`);
       return;
     }
 
-    setState_(actorKey, { step: 'await_wh', out: st.out, sku });
+    // 建一個 map，之後點倉庫要做「不超扣」檢查
+    const whStockMap = {};
+    for (const r of available) {
+      whStockMap[r.warehouse_code] = { box: r.box, piece: r.piece, name: r.warehouse_name ?? '' };
+    }
+
+    setState_(actorKey, { step: 'await_wh', out: st.out, sku, whStockMap });
 
     const lines = available.map(r => `- ${r.warehouse_code}（${r.warehouse_name ?? ''}）：${r.box}箱 ${r.piece}件`);
     const qr = buildWarehouseQuickReply_(
@@ -282,11 +326,18 @@ async function handleTextMessage(ev) {
       }))
     );
 
-    await lineClient.replyMessage(ev.replyToken, {
-      type: 'text',
-      text: `✅ SKU：${sku}\n請選擇倉庫：\n${lines.join('\n')}\n（或輸入「取消」）`,
-      quickReply: qr,
-    });
+    await safeReplyText_(ev, `✅ SKU：${sku}\n請選擇倉庫：\n${lines.join('\n')}\n（或輸入「取消」）`);
+    // quickReply 需要用 replyMessage 才能帶出來，所以補一個純 reply（不成功就算了）
+    try {
+      await lineClient.replyMessage(ev.replyToken, {
+        type: 'text',
+        text: `點下面選倉庫（main/withdraw/swap）`,
+        quickReply: qr,
+      });
+    } catch (e) {
+      console.error('[quickReply reply failed]', e?.message || e);
+    }
+    return;
   }
 }
 
@@ -305,6 +356,21 @@ async function handlePostback(ev) {
 
   const outBox = Number(st.out?.boxQty ?? 0);
   const outPiece = Number(st.out?.pieceQty ?? 0);
+
+  // ✅ 防呆：不允許扣超過庫存（箱對箱、件對件）
+  const stock = st.whStockMap?.[wh];
+  const stockBox = Number(stock?.box ?? 0);
+  const stockPiece = Number(stock?.piece ?? 0);
+
+  if (outBox > stockBox || outPiece > stockPiece) {
+    await safeReplyText_(
+      ev,
+      `❌ 庫存不足，拒絕出庫\nSKU：${st.sku}\n倉庫：${wh}\n欲出：${outBox}箱 ${outPiece}件\n現有：${stockBox}箱 ${stockPiece}件`
+    );
+    // 保留狀態，讓你可直接再選一次/或取消重來
+    return;
+  }
+
   const atIso = new Date().toISOString();
 
   try {
@@ -318,6 +384,7 @@ async function handlePostback(ev) {
       createdBy,
     });
 
+    // 扣完 requery 回覆最新庫存
     const bizDate = getTaipeiTodayDateString_();
     const rows = await rpcGetBusinessDayStock_(GROUP_CODE, bizDate);
     const picked = rows.find(
@@ -329,22 +396,14 @@ async function handlePostback(ev) {
     const afterBox = Number(picked?.box ?? 0);
     const afterPiece = Number(picked?.piece ?? 0);
 
-    await lineClient.replyMessage(ev.replyToken, {
-      type: 'text',
-      text:
-        `✅ 出庫成功\n` +
-        `SKU：${st.sku}\n` +
-        `倉庫：${wh}\n` +
-        `出庫：${outBox}箱 ${outPiece}件\n` +
-        `最新庫存：${afterBox}箱 ${afterPiece}件`,
-    });
+    await safeReplyText_(
+      ev,
+      `✅ 出庫成功\nSKU：${st.sku}\n倉庫：${wh}\n出庫：${outBox}箱 ${outPiece}件\n最新庫存：${afterBox}箱 ${afterPiece}件`
+    );
   } catch (err) {
     console.error('[fifo_out_and_log error]', err);
     clearState_(actorKey);
-    await lineClient.replyMessage(ev.replyToken, {
-      type: 'text',
-      text: `❌ 出庫失敗：${err?.message ?? 'unknown error'}`,
-    });
+    await safeReplyText_(ev, `❌ 出庫失敗：${err?.message ?? 'unknown error'}`);
   }
 }
 
@@ -368,13 +427,10 @@ async function handleEvent(ev) {
 /* =========================
  * Routes
  * ========================= */
-
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
 app.post('/webhook', middleware(lineConfig), (req, res) => {
-  // 鐵律：立刻回 200
   res.sendStatus(200);
-
   const events = req.body?.events ?? [];
   for (const ev of events) {
     console.log('[LINE EVENT]', JSON.stringify(ev));
