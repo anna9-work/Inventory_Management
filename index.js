@@ -1,3 +1,4 @@
+// index.js
 import 'dotenv/config';
 import express from 'express';
 import { middleware, Client } from '@line/bot-sdk';
@@ -20,7 +21,7 @@ const {
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) throw new Error('Missing LINE env');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing Supabase env');
 
-const BOT_VER = 'V2026-01-17_CMD_PORT';
+const BOT_VER = 'V2026-01-17_CMD_BARCODE_STUB';
 
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
@@ -51,7 +52,6 @@ async function safeReplyText_(ev, text, quickReply = undefined) {
     await lineClient.replyMessage(ev.replyToken, { type: 'text', text, ...(quickReply ? { quickReply } : {}) });
   } catch (e) {
     console.error('[LINE replyMessage failed]', e?.message || e);
-    // fallback: push (only works in 1:1 chat)
     if (to) {
       try {
         await lineClient.pushMessage(to, { type: 'text', text });
@@ -72,11 +72,11 @@ function getBizDate0500TPE_() {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-  }).format(d); // yyyy-mm-dd
+  }).format(d);
 }
 
 /* =========================
- * stock rpc (same as new: get_business_day_stock(p_group,p_biz_date))
+ * stock rpc
  * ========================= */
 async function rpcGetBusinessDayStock_(groupCode, bizDateStr) {
   const { data, error } = await supabase.rpc('get_business_day_stock', {
@@ -91,7 +91,7 @@ async function rpcFifoOutAndLog_({ groupCode, sku, warehouseCode, outBox, outPie
   const { data, error } = await supabase.rpc('fifo_out_and_log', {
     p_group: groupCode,
     p_product_sku: sku,
-    p_warehouse_name: warehouseCode, // 傳 warehouse_code (main/withdraw/swap/unspecified)
+    p_warehouse_name: warehouseCode,
     p_out_box: outBox,
     p_out_piece: outPiece,
     p_at: atIso,
@@ -102,7 +102,7 @@ async function rpcFifoOutAndLog_({ groupCode, sku, warehouseCode, outBox, outPie
 }
 
 /* =========================
- * warehouse label/code (簡化版：固定表)
+ * warehouse label/code
  * ========================= */
 const FIX_CODE_TO_NAME = new Map([
   ['main', '總倉'],
@@ -115,31 +115,24 @@ const FIX_CODE_TO_NAME = new Map([
 function skuKey_(s) {
   return String(s || '').trim().toLowerCase();
 }
-
 function pickNum_(v, fb = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fb;
 }
-
 function resolveWarehouseLabel_(codeOrName) {
   const k = String(codeOrName || '').trim();
   if (!k) return '未指定';
   if (FIX_CODE_TO_NAME.has(k)) return FIX_CODE_TO_NAME.get(k);
   return k;
 }
-
 function getWarehouseCodeForLabel_(labelOrCode) {
   const s = String(labelOrCode || '').trim();
   if (!s) return 'unspecified';
   const low = s.toLowerCase();
-
-  // code 直接用
   if (/^[a-z0-9_]+$/i.test(low)) {
     if (low === 'main_warehouse') return 'main';
     return low;
   }
-
-  // 中文反查
   for (const [code, name] of FIX_CODE_TO_NAME.entries()) {
     if (name === s) {
       if (code === 'main_warehouse') return 'main';
@@ -150,10 +143,10 @@ function getWarehouseCodeForLabel_(labelOrCode) {
 }
 
 /* =========================
- * caches (command flow needs)
+ * caches
  * ========================= */
-const LAST_SKU_BY_ACTOR = new Map(); // actorKey -> sku(lower)
-const LAST_WH_BY_ACTOR = new Map(); // actorKey -> warehouse_code
+const LAST_SKU_BY_ACTOR = new Map();
+const LAST_WH_BY_ACTOR = new Map();
 
 function getActorKey_(ev) {
   const s = ev.source || {};
@@ -179,7 +172,7 @@ function getLastWh_(actorKey) {
 }
 
 /* =========================
- * command parser (from old "指令的部分")
+ * command parser (加上「條碼」)
  * ========================= */
 function parseCommand(text) {
   const t = String(text || '').trim();
@@ -187,10 +180,13 @@ function parseCommand(text) {
 
   if (/^(db|DB|版本)$/.test(t)) return { type: 'db' };
 
-  if (!/^(查|查詢|編號|#|出庫|出|倉)/.test(t)) return null;
+  if (!/^(查|查詢|編號|#|條碼|出庫|出|倉)/.test(t)) return null;
 
   const mWhSel = t.match(/^倉(?:庫)?\s*(.+)$/);
   if (mWhSel) return { type: 'wh_select', warehouse: mWhSel[1].trim() };
+
+  const mBarcode = t.match(/^條碼[:：]?\s*(.+)$/);
+  if (mBarcode) return { type: 'barcode', barcode: mBarcode[1].trim() };
 
   const mSkuHash = t.match(/^#\s*(.+)$/);
   if (mSkuHash) return { type: 'sku', sku: mSkuHash[1].trim() };
@@ -201,7 +197,6 @@ function parseCommand(text) {
   const mQuery = t.match(/^查(?:詢)?\s*(.+)$/);
   if (mQuery) return { type: 'query', keyword: mQuery[1].trim() };
 
-  // 出/出庫：支援 出3箱2件、出3箱、出2件、出1（無單位視為件）、可帶 @倉庫
   const mChange = t.match(
     /^(出庫|出)\s*(?:(\d+)\s*箱)?\s*(?:(\d+)\s*(?:個|散|件))?\s*(?:(\d+))?(?:\s*(?:@|（?\(?倉庫[:：=]\s*)([^)）]+)\)?)?\s*$/,
   );
@@ -212,8 +207,6 @@ function parseCommand(text) {
 
     const rawHasDigit = /\d+/.test(t);
     const hasBoxOrPieceUnit = /箱|個|散|件/.test(t);
-
-    // ✅ 舊版行為：沒寫單位但有數字 -> 當作 piece
     const piece =
       pieceLabeled ||
       pieceTail ||
@@ -234,7 +227,7 @@ function parseCommand(text) {
 }
 
 /* =========================
- * postback parser (倉庫點選/出庫)
+ * postback parser
  * ========================= */
 function parsePostback(data) {
   const s = String(data || '').trim();
@@ -243,13 +236,8 @@ function parsePostback(data) {
   const a = params.get('a');
 
   if (a === 'wh_select') {
-    return {
-      type: 'wh_select_postback',
-      sku: skuKey_(params.get('sku')),
-      wh: String(params.get('wh') || ''),
-    };
+    return { type: 'wh_select_postback', sku: skuKey_(params.get('sku')), wh: String(params.get('wh') || '') };
   }
-
   if (a === 'out') {
     return {
       type: 'out_postback',
@@ -259,12 +247,11 @@ function parsePostback(data) {
       piece: parseInt(params.get('piece') || '0', 10) || 0,
     };
   }
-
   return null;
 }
 
 /* =========================
- * quick reply builders (指令流程會用)
+ * quick reply builders
  * ========================= */
 function buildQuickReplyWarehousesForQuery_(sku, whList) {
   return {
@@ -279,7 +266,6 @@ function buildQuickReplyWarehousesForQuery_(sku, whList) {
     })),
   };
 }
-
 function buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList) {
   return {
     items: whList.slice(0, 12).map((w) => ({
@@ -295,7 +281,7 @@ function buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList) {
 }
 
 /* =========================
- * stock helpers for command flow
+ * stock helpers
  * ========================= */
 async function getWarehousesStockBySku_(sku) {
   const bizDate = getBizDate0500TPE_();
@@ -323,26 +309,32 @@ async function getWarehouseSnapshot_(sku, whCode) {
 }
 
 /* =========================
- * command handlers (核心：只改這段)
+ * command handlers (新增 barcode 指令：目前 DB 無條碼資料 → 回提示)
  * ========================= */
 async function handleCommandMessage_(ev, parsed) {
   const actorKey = getActorKey_(ev);
   const createdBy = getCreatedBy_(ev);
 
-  // db/版本
   if (parsed.type === 'db') {
     const bizDate = getBizDate0500TPE_();
     await safeReplyText_(ev, `BOT=${BOT_VER}\nDB_HOST=${SUPA_HOST}\nBIZ_DATE_0500=${bizDate}`);
     return;
   }
 
-  // 查詢：目前專案先不做（舊版有做 stock list keyword search）
+  // ✅ 新增：條碼
+  if (parsed.type === 'barcode') {
+    await safeReplyText_(
+      ev,
+      `目前資料庫沒有「條碼→SKU」對照資料（products 也沒有條碼欄位）。\n請先建立一張 product_barcodes 表或在 products 加 barcode 欄位，之後我再把條碼查詢接上。\n你輸入的條碼：${parsed.barcode}`,
+    );
+    return;
+  }
+
   if (parsed.type === 'query') {
     await safeReplyText_(ev, `目前未開放「查詢」；請用「編號 a564」或「#a564」指定 SKU`);
     return;
   }
 
-  // 設定 SKU（編號 / #）
   if (parsed.type === 'sku') {
     const sku = skuKey_(parsed.sku);
     if (!sku) return;
@@ -355,13 +347,8 @@ async function handleCommandMessage_(ev, parsed) {
       return;
     }
 
-    // 多倉 → 叫選倉；單倉 → 直接回庫存並記憶
     if (whList.length >= 2) {
-      await safeReplyText_(
-        ev,
-        `編號：${sku}\n👉請選擇倉庫`,
-        buildQuickReplyWarehousesForQuery_(sku, whList),
-      );
+      await safeReplyText_(ev, `編號：${sku}\n👉請選擇倉庫`, buildQuickReplyWarehousesForQuery_(sku, whList));
       return;
     }
 
@@ -371,7 +358,6 @@ async function handleCommandMessage_(ev, parsed) {
     return;
   }
 
-  // 文字選倉（倉 xxx）
   if (parsed.type === 'wh_select') {
     const sku = getLastSku_(actorKey);
     if (!sku) {
@@ -387,7 +373,6 @@ async function handleCommandMessage_(ev, parsed) {
     return;
   }
 
-  // 出庫（出/出庫）
   if (parsed.type === 'change' && parsed.action === 'out') {
     const outBox = Number(parsed.box || 0);
     const outPiece = Number(parsed.piece || 0);
@@ -417,20 +402,14 @@ async function handleCommandMessage_(ev, parsed) {
       if (lastWh && whList.some((w) => w.code === lastWh)) chosenWhCode = lastWh;
     }
 
-    // 沒指定/沒記憶：多倉就叫你選；單倉就直接用
     if (!chosenWhCode) {
       if (whList.length >= 2) {
-        await safeReplyText_(
-          ev,
-          '請選擇要出庫的倉庫',
-          buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList),
-        );
+        await safeReplyText_(ev, '請選擇要出庫的倉庫', buildQuickReplyWarehousesForOut_(sku, outBox, outPiece, whList));
         return;
       }
       chosenWhCode = whList[0].code;
     }
 
-    // 出庫前 requery（防呆不超扣）
     const snapBefore = await getWarehouseSnapshot_(sku, chosenWhCode);
     if (outBox > 0 && snapBefore.box < outBox) {
       await safeReplyText_(ev, `庫存不足，無法出庫（倉別：${snapBefore.label}）\n目前庫存：${snapBefore.box}箱${snapBefore.piece}件`);
@@ -441,7 +420,6 @@ async function handleCommandMessage_(ev, parsed) {
       return;
     }
 
-    // 扣庫
     try {
       await rpcFifoOutAndLog_({
         groupCode: GROUP_CODE,
@@ -460,13 +438,11 @@ async function handleCommandMessage_(ev, parsed) {
 
     setLastWh_(actorKey, chosenWhCode);
 
-    // 出庫後再查一次
     const snapAfter = await getWarehouseSnapshot_(sku, chosenWhCode);
     await safeReplyText_(
       ev,
       `✅ 出庫成功\n編號：${sku}\n倉別：${snapAfter.label}\n出庫：${outBox}箱 ${outPiece}件\n👉目前庫存：${snapAfter.box}箱${snapAfter.piece}件`,
     );
-    return;
   }
 }
 
@@ -491,7 +467,6 @@ async function handlePostback_(ev) {
   const pb = parsePostback(ev?.postback?.data);
   if (!pb) return;
 
-  // 點倉庫（查詢用）：等同「倉 xxx」
   if (pb.type === 'wh_select_postback') {
     const sku = pb.sku || getLastSku_(actorKey);
     if (!sku) {
@@ -507,7 +482,6 @@ async function handlePostback_(ev) {
     return;
   }
 
-  // 點倉庫（出庫用）：直接執行出庫（含防呆）
   if (pb.type === 'out_postback') {
     const createdBy = getCreatedBy_(ev);
     const sku = pb.sku || getLastSku_(actorKey);
@@ -580,7 +554,6 @@ async function handleEvent_(ev) {
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 app.post('/webhook', middleware(lineConfig), (req, res) => {
-  // 鐵律：立刻回 200
   res.sendStatus(200);
 
   const events = req.body?.events ?? [];
