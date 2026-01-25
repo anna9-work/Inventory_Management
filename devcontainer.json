@@ -1,5 +1,0 @@
-{
-  "name": "flutter-manual",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-  "postCreateCommand": "git clone https://github.com/flutter/flutter.git -b stable /opt/flutter && echo 'export PATH=/opt/flutter/bin:$PATH' >> ~/.bashrc && echo 'export PATH=/opt/flutter/bin:$PATH' >> ~/.profile && /opt/flutter/bin/flutter doctor"
-}
